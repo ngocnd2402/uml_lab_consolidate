@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import logging
 from typing import Any, Dict, List, Optional
@@ -67,7 +65,7 @@ class OpenSearchLabMapper:
             return None
         return data.get("_source")
 
-    # ---- query builders ----
+    # ---- query builders: concept text ----
     def _build_dismax_query(self, q: str, size: int) -> Dict[str, Any]:
         """
         Ưu tiên:
@@ -76,7 +74,6 @@ class OpenSearchLabMapper:
              - multi_match (operator=and) — tất cả terms phải khớp
           2) PREFIX:
              - match_phrase_prefix
-             - multi_match bool_prefix
              - prefix explicit (preferred_term / synonyms)
           3) FUZZY (thấp nhất):
              - multi_match fuzziness=AUTO
@@ -153,6 +150,70 @@ class OpenSearchLabMapper:
         }
         return query
 
+    # ---- query builders: code search ----
+    def _build_code_query(self, code: str, size: int, system: Optional[str]) -> Dict[str, Any]:
+        """
+        Tìm theo mã code trong các bucket nested:
+        - loinc_codes.code
+        - snomed_codes.code
+        - icd10_codes.code
+        - other_codes.code
+        Ưu tiên: exact (term) > prefix > fuzzy.
+        Cho phép hạn chế theo 'system' ∈ {loinc, snomed, icd10, other}.
+        """
+        # xác định các path cần tìm
+        system = (system or "").strip().lower()
+        allowed_paths_all = ["loinc_codes", "snomed_codes", "icd10_codes", "other_codes"]
+        if system == "loinc":
+            paths = ["loinc_codes"]
+        elif system == "snomed":
+            paths = ["snomed_codes"]
+        elif system == "icd10":
+            paths = ["icd10_codes"]
+        elif system == "other":
+            paths = ["other_codes"]
+        else:
+            paths = allowed_paths_all
+
+        code_lower = code.lower()
+
+        nested_queries: List[Dict[str, Any]] = []
+        for p in paths:
+            # dis_max trong từng nested: exact > prefix > fuzzy
+            per_path_dismax = {
+                "dis_max": {
+                    "tie_breaker": 0.0,
+                    "queries": [
+                        # exact (term) — cao nhất
+                        {"term": {f"{p}.code": {"value": code, "boost": 10.0}}},
+                        # prefix — kế tiếp
+                        {"prefix": {f"{p}.code": {"value": code_lower, "boost": 7.0}}},
+                        # fuzzy — thấp nhất (áp trên code; chấp nhận sai 1-2 ký tự)
+                        {"fuzzy": {f"{p}.code": {"value": code, "fuzziness": "AUTO", "boost": 5.0}}},
+                    ]
+                }
+            }
+            nested_queries.append({
+                "nested": {
+                    "path": p,
+                    "query": per_path_dismax
+                }
+            })
+
+        # Tổng thể: dis_max across các nested path
+        query: Dict[str, Any] = {
+            "size": size,
+            "_source": True,
+            "query": {
+                "dis_max": {
+                    "tie_breaker": 0.0,
+                    "queries": nested_queries
+                }
+            },
+            "track_total_hits": True,
+        }
+        return query
+
     # ---- API-shape methods (giữ nguyên output format) ----
     def map_lab_name_to_codes(self, lab_name: str, size: int = 25) -> Dict[str, Any]:
         body = self._build_dismax_query(lab_name, size=size)
@@ -193,6 +254,42 @@ class OpenSearchLabMapper:
     def search_by_term(self, term: str, size: int = 25) -> List[Dict[str, Any]]:
         out = self.map_lab_name_to_codes(term, size=size)
         return out["matched_concepts"]
+
+    def search_by_code(self, code: str, size: int = 25, system: Optional[str] = None) -> Dict[str, Any]:
+        body = self._build_code_query(code, size=size, system=system)
+        res = self._search(body)
+        hits = res.get("hits", {}).get("hits", [])
+        total = res.get("hits", {}).get("total", {})
+        total_val = total.get("value", len(hits))
+
+        matched_concepts: List[Dict[str, Any]] = []
+        for h in hits:
+            src = h.get("_source", {})
+            total_codes = (
+                len(src.get("loinc_codes", []))
+                + len(src.get("snomed_codes", []))
+                + len(src.get("icd10_codes", []))
+                + len(src.get("other_codes", []))
+            )
+            matched_concepts.append({
+                "cui": src.get("cui"),
+                "preferred_term": src.get("preferred_term"),
+                "synonyms": src.get("synonyms", [])[:10],
+                "semantic_types": src.get("semantic_types", []),
+                "loinc_codes": src.get("loinc_codes", []),
+                "snomed_codes": src.get("snomed_codes", []),
+                "icd10_codes": src.get("icd10_codes", []),
+                "other_codes": src.get("other_codes", []),
+                "total_codes": total_codes,
+            })
+
+        best_match = matched_concepts[0] if matched_concepts else None
+        return {
+            "query_term": code,
+            "matched_concepts": matched_concepts,
+            "best_match": best_match,
+            "total": total_val,
+        }
 
     def get_concept(self, cui: str) -> Optional[Dict[str, Any]]:
         src = self._get_by_id(cui)
@@ -273,3 +370,29 @@ async def search_concepts(
 ):
     results = mapper.search_by_term(term, size=limit)
     return {"query": term, "count": len(results), "results": results[:limit]}
+
+
+@app.get("/search-code")
+async def search_code(
+    code: str = Query(..., description="Code to lookup (e.g., LOINC/SNOMED/ICD-10-PCS/CCSR)"),
+    system: Optional[str] = Query(
+        None,
+        description="Restrict to a code system: loinc | snomed | icd10 | other",
+        regex="^(loinc|snomed|icd10|other)$"
+    ),
+    limit: int = Query(25, ge=1, le=200, description="Max results"),
+    mapper: OpenSearchLabMapper = Depends(get_mapper),
+):
+    """
+    Tìm concept theo mã code. Ưu tiên exact > prefix > fuzzy.
+    - system = loinc | snomed | icd10 | other (tùy chọn)
+    """
+    out = mapper.search_by_code(code, size=limit, system=system)
+    if not out["matched_concepts"]:
+        raise HTTPException(status_code=404, detail=f"No concepts found for code '{code}'")
+    return {
+        "query": out["query_term"],
+        "total_matches": out["total"],
+        "best_match": out["best_match"],
+        "all_matches": out["matched_concepts"],
+    }
