@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import os
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+from enum import Enum
 from dotenv import load_dotenv
 
 from contextlib import asynccontextmanager
@@ -24,6 +27,13 @@ if not log.handlers:
     h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
     log.addHandler(h)
 log.setLevel(logging.INFO)
+
+# =============== Enum cho code system ==========
+class CodeSystem(str, Enum):
+    loinc = "loinc"
+    snomed = "snomed"
+    icd10 = "icd10"
+    other = "other"
 
 
 # =============== OpenSearch client mảnh gọn ===============
@@ -69,14 +79,9 @@ class OpenSearchLabMapper:
     def _build_dismax_query(self, q: str, size: int) -> Dict[str, Any]:
         """
         Ưu tiên:
-          1) MATCH tuyệt đối (cao nhất):
-             - match_phrase (exact phrase)
-             - multi_match (operator=and) — tất cả terms phải khớp
-          2) PREFIX:
-             - match_phrase_prefix
-             - prefix explicit (preferred_term / synonyms)
-          3) FUZZY (thấp nhất):
-             - multi_match fuzziness=AUTO
+          1) MATCH tuyệt đối (cao nhất): match_phrase + operator=and
+          2) PREFIX: phrase_prefix + prefix explicit
+          3) FUZZY (thấp nhất): fuzziness=AUTO
         Chỉ đánh vào preferred_term và synonyms.
         """
         fields_boosted = [
@@ -84,7 +89,7 @@ class OpenSearchLabMapper:
             "synonyms^3",
         ]
 
-        q_lower = q.lower()  # cho prefix (không qua analyzer) nếu field đã lowercased khi index
+        q_lower = q.lower()
 
         query: Dict[str, Any] = {
             "size": size,
@@ -93,11 +98,11 @@ class OpenSearchLabMapper:
                 "dis_max": {
                     "tie_breaker": 0.0,
                     "queries": [
-                        # (1) MATCH tuyệt đối — cao nhất
+                        # (1) MATCH tuyệt đối
                         {
                             "multi_match": {
                                 "query": q,
-                                "type": "phrase",         # match_phrase
+                                "type": "phrase",
                                 "fields": fields_boosted,
                                 "slop": 0,
                                 "boost": 10.0
@@ -108,12 +113,12 @@ class OpenSearchLabMapper:
                                 "query": q,
                                 "type": "best_fields",
                                 "fields": fields_boosted,
-                                "operator": "and",        # tất cả terms phải khớp
+                                "operator": "and",
                                 "boost": 8.0
                             }
                         },
 
-                        # (2) PREFIX — mức ưu tiên kế tiếp
+                        # (2) PREFIX
                         {
                             "multi_match": {
                                 "query": q,
@@ -133,7 +138,7 @@ class OpenSearchLabMapper:
                             }
                         },
 
-                        # (3) FUZZY — thấp nhất
+                        # (3) FUZZY
                         {
                             "multi_match": {
                                 "query": q,
@@ -151,7 +156,7 @@ class OpenSearchLabMapper:
         return query
 
     # ---- query builders: code search ----
-    def _build_code_query(self, code: str, size: int, system: Optional[str]) -> Dict[str, Any]:
+    def _build_code_query(self, code: str, size: int, system: Optional[Union[str, CodeSystem]]) -> Dict[str, Any]:
         """
         Tìm theo mã code trong các bucket nested:
         - loinc_codes.code
@@ -161,16 +166,17 @@ class OpenSearchLabMapper:
         Ưu tiên: exact (term) > prefix > fuzzy.
         Cho phép hạn chế theo 'system' ∈ {loinc, snomed, icd10, other}.
         """
-        # xác định các path cần tìm
-        system = (system or "").strip().lower()
+        # normalize enum/string -> lowercase string
+        sys_str = (system.value if isinstance(system, CodeSystem) else (system or "")).strip().lower()
+
         allowed_paths_all = ["loinc_codes", "snomed_codes", "icd10_codes", "other_codes"]
-        if system == "loinc":
+        if sys_str == "loinc":
             paths = ["loinc_codes"]
-        elif system == "snomed":
+        elif sys_str == "snomed":
             paths = ["snomed_codes"]
-        elif system == "icd10":
+        elif sys_str == "icd10":
             paths = ["icd10_codes"]
-        elif system == "other":
+        elif sys_str == "other":
             paths = ["other_codes"]
         else:
             paths = allowed_paths_all
@@ -179,37 +185,22 @@ class OpenSearchLabMapper:
 
         nested_queries: List[Dict[str, Any]] = []
         for p in paths:
-            # dis_max trong từng nested: exact > prefix > fuzzy
             per_path_dismax = {
                 "dis_max": {
                     "tie_breaker": 0.0,
                     "queries": [
-                        # exact (term) — cao nhất
-                        {"term": {f"{p}.code": {"value": code, "boost": 10.0}}},
-                        # prefix — kế tiếp
-                        {"prefix": {f"{p}.code": {"value": code_lower, "boost": 7.0}}},
-                        # fuzzy — thấp nhất (áp trên code; chấp nhận sai 1-2 ký tự)
-                        {"fuzzy": {f"{p}.code": {"value": code, "fuzziness": "AUTO", "boost": 5.0}}},
+                        {"term": {f"{p}.code": {"value": code, "boost": 10.0}}},  # exact
+                        {"prefix": {f"{p}.code": {"value": code_lower, "boost": 7.0}}},  # prefix
+                        {"fuzzy":  {f"{p}.code": {"value": code, "fuzziness": "AUTO", "boost": 5.0}}},  # fuzzy
                     ]
                 }
             }
-            nested_queries.append({
-                "nested": {
-                    "path": p,
-                    "query": per_path_dismax
-                }
-            })
+            nested_queries.append({"nested": {"path": p, "query": per_path_dismax}})
 
-        # Tổng thể: dis_max across các nested path
         query: Dict[str, Any] = {
             "size": size,
             "_source": True,
-            "query": {
-                "dis_max": {
-                    "tie_breaker": 0.0,
-                    "queries": nested_queries
-                }
-            },
+            "query": {"dis_max": {"tie_breaker": 0.0, "queries": nested_queries}},
             "track_total_hits": True,
         }
         return query
@@ -255,7 +246,7 @@ class OpenSearchLabMapper:
         out = self.map_lab_name_to_codes(term, size=size)
         return out["matched_concepts"]
 
-    def search_by_code(self, code: str, size: int = 25, system: Optional[str] = None) -> Dict[str, Any]:
+    def search_by_code(self, code: str, size: int = 25, system: Optional[Union[str, CodeSystem]] = None) -> Dict[str, Any]:
         body = self._build_code_query(code, size=size, system=system)
         res = self._search(body)
         hits = res.get("hits", {}).get("hits", [])
@@ -375,17 +366,16 @@ async def search_concepts(
 @app.get("/search-code")
 async def search_code(
     code: str = Query(..., description="Code to lookup (e.g., LOINC/SNOMED/ICD-10-PCS/CCSR)"),
-    system: Optional[str] = Query(
+    system: Optional[CodeSystem] = Query(
         None,
-        description="Restrict to a code system: loinc | snomed | icd10 | other",
-        regex="^(loinc|snomed|icd10|other)$"
+        description="Restrict to a code system"
     ),
     limit: int = Query(25, ge=1, le=200, description="Max results"),
     mapper: OpenSearchLabMapper = Depends(get_mapper),
 ):
     """
     Tìm concept theo mã code. Ưu tiên exact > prefix > fuzzy.
-    - system = loinc | snomed | icd10 | other (tùy chọn)
+    - system: dropdown {loinc | snomed | icd10 | other}
     """
     out = mapper.search_by_code(code, size=limit, system=system)
     if not out["matched_concepts"]:
