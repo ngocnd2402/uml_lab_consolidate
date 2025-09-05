@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 from enum import Enum
 from dotenv import load_dotenv
 
@@ -10,17 +10,17 @@ from contextlib import asynccontextmanager
 import requests
 from fastapi import FastAPI, HTTPException, Query, Depends, Request
 
-# nạp biến môi trường từ .env nếu có
+# load environment variables from .env if present
 load_dotenv()
 
-# =============== Config từ ENV =================
+# =============== ENV Config ===============
 OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "").rstrip("/")
 OPENSEARCH_USER = os.getenv("OPENSEARCH_USER", "")
 OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD", "")
 OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "umls_labs")
 OPENSEARCH_VERIFY_SSL = (os.getenv("OPENSEARCH_VERIFY_SSL", "true").lower() != "false")
 
-# =============== Logging =======================
+# =============== Logging ===============
 log = logging.getLogger("umls_api")
 if not log.handlers:
     h = logging.StreamHandler()
@@ -28,19 +28,36 @@ if not log.handlers:
     log.addHandler(h)
 log.setLevel(logging.INFO)
 
-# =============== Enum cho code system ==========
+# =============== Enum for code systems ==============
 class CodeSystem(str, Enum):
     loinc = "loinc"
     snomed = "snomed"
     icd10 = "icd10"
     other = "other"
 
+# ======== Enums for UTS-like search ============
+class InputType(str, Enum):
+    atom = "atom"
+    code = "code"
+    sourceConcept = "sourceConcept"
+    sourceDescriptor = "sourceDescriptor"
+    sourceUi = "sourceUi"
+    tty = "tty"  # not parsing by TTY; treat like 'atom'
 
-# =============== OpenSearch client mảnh gọn ===============
+class SearchType(str, Enum):
+    words = "words"                 # default
+    exact = "exact"
+    rightTruncation = "rightTruncation"
+    leftTruncation = "leftTruncation"      # fallback -> words
+    normalizedString = "normalizedString"  # fallback -> words
+    normalizedWords = "normalizedWords"    # fallback -> words
+
+
+# =============== Minimal OpenSearch client ===============
 class OpenSearchLabMapper:
     """
-    Truy vấn trực tiếp index OpenSearch đã ingest.
-    Giữ nguyên schema và output format như code full.
+    Query an ingested OpenSearch index.
+    Preserve schema and output format as in the full codebase.
     """
     def __init__(self, base_url: str, index_name: str, user: str, password: str, verify_ssl: bool = True):
         self.base_url = base_url.rstrip("/")
@@ -75,22 +92,13 @@ class OpenSearchLabMapper:
             return None
         return data.get("_source")
 
-    # ---- query builders: concept text ----
+    # ---- query builders: concept text (legacy) ----
     def _build_dismax_query(self, q: str, size: int) -> Dict[str, Any]:
-        """
-        Ưu tiên:
-          1) MATCH tuyệt đối (cao nhất): match_phrase + operator=and
-          2) PREFIX: phrase_prefix + prefix explicit
-          3) FUZZY (thấp nhất): fuzziness=AUTO
-        Chỉ đánh vào preferred_term và synonyms.
-        """
         fields_boosted = [
             "preferred_term^5",
             "synonyms^3",
         ]
-
         q_lower = q.lower()
-
         query: Dict[str, Any] = {
             "size": size,
             "_source": True,
@@ -98,56 +106,14 @@ class OpenSearchLabMapper:
                 "dis_max": {
                     "tie_breaker": 0.0,
                     "queries": [
-                        # (1) MATCH tuyệt đối
-                        {
-                            "multi_match": {
-                                "query": q,
-                                "type": "phrase",
-                                "fields": fields_boosted,
-                                "slop": 0,
-                                "boost": 10.0
-                            }
-                        },
-                        {
-                            "multi_match": {
-                                "query": q,
-                                "type": "best_fields",
-                                "fields": fields_boosted,
-                                "operator": "and",
-                                "boost": 8.0
-                            }
-                        },
-
-                        # (2) PREFIX
-                        {
-                            "multi_match": {
-                                "query": q,
-                                "type": "phrase_prefix",
-                                "fields": fields_boosted,
-                                "slop": 2,
-                                "boost": 7.0
-                            }
-                        },
-                        {
-                            "bool": {
-                                "should": [
-                                    {"prefix": {"preferred_term": {"value": q_lower, "boost": 7.0}}},
-                                    {"prefix": {"synonyms": {"value": q_lower, "boost": 7.0}}},
-                                ],
-                                "minimum_should_match": 1
-                            }
-                        },
-
-                        # (3) FUZZY
-                        {
-                            "multi_match": {
-                                "query": q,
-                                "fields": fields_boosted,
-                                "fuzziness": "AUTO",
-                                "operator": "and",
-                                "boost": 5.0
-                            }
-                        },
+                        {"multi_match": {"query": q, "type": "phrase", "fields": fields_boosted, "slop": 0, "boost": 10.0}},
+                        {"multi_match": {"query": q, "type": "best_fields", "fields": fields_boosted, "operator": "and", "boost": 8.0}},
+                        {"multi_match": {"query": q, "type": "phrase_prefix", "fields": fields_boosted, "slop": 2, "boost": 7.0}},
+                        {"bool": {"should": [
+                            {"prefix": {"preferred_term": {"value": q_lower, "boost": 7.0}}},
+                            {"prefix": {"synonyms": {"value": q_lower, "boost": 7.0}}},
+                        ], "minimum_should_match": 1}},
+                        {"multi_match": {"query": q, "fields": fields_boosted, "fuzziness": "AUTO", "operator": "and", "boost": 5.0}},
                     ],
                 }
             },
@@ -155,20 +121,44 @@ class OpenSearchLabMapper:
         }
         return query
 
-    # ---- query builders: code search ----
-    def _build_code_query(self, code: str, size: int, system: Optional[Union[str, CodeSystem]]) -> Dict[str, Any]:
-        """
-        Tìm theo mã code trong các bucket nested:
-        - loinc_codes.code
-        - snomed_codes.code
-        - icd10_codes.code
-        - other_codes.code
-        Ưu tiên: exact (term) > prefix > fuzzy.
-        Cho phép hạn chế theo 'system' ∈ {loinc, snomed, icd10, other}.
-        """
-        # normalize enum/string -> lowercase string
-        sys_str = (system.value if isinstance(system, CodeSystem) else (system or "")).strip().lower()
+    # ---- query builders: UTS-like text (new, with paging) ----
+    def _build_text_query_uts(self, q: str, size: int, from_: int, search_type: SearchType) -> Dict[str, Any]:
+        fields = ["preferred_term^5", "synonyms^3"]
+        q_lower = (q or "").lower()
 
+        def dismax(queries: List[Dict[str, Any]]) -> Dict[str, Any]:
+            return {"dis_max": {"tie_breaker": 0.0, "queries": queries}}
+
+        if search_type == SearchType.exact:
+            queries = [
+                {"multi_match": {"query": q, "type": "phrase", "fields": fields, "slop": 0, "boost": 10.0}},
+                {"multi_match": {"query": q, "type": "best_fields", "fields": fields, "operator": "and", "boost": 8.0}},
+            ]
+        elif search_type == SearchType.rightTruncation:
+            queries = [
+                {"multi_match": {"query": q, "type": "phrase_prefix", "fields": fields, "slop": 2, "boost": 8.0}},
+                {"bool": {"should": [
+                    {"prefix": {"preferred_term": {"value": q_lower, "boost": 7.0}}},
+                    {"prefix": {"synonyms": {"value": q_lower, "boost": 6.0}}},
+                ], "minimum_should_match": 1}},
+            ]
+        else:  # words + fallbacks
+            queries = [
+                {"multi_match": {"query": q, "type": "best_fields", "fields": fields, "operator": "and", "boost": 8.0}},
+                {"multi_match": {"query": q, "type": "bool_prefix", "fields": fields, "boost": 6.0}},
+            ]
+
+        return {
+            "from": from_,
+            "size": size,
+            "_source": True,
+            "track_total_hits": True,
+            "query": dismax(queries),
+        }
+
+    # ---- query builders: code search (legacy) ----
+    def _build_code_query(self, code: str, size: int, system: Optional[Union[str, CodeSystem]]) -> Dict[str, Any]:
+        sys_str = (system.value if isinstance(system, CodeSystem) else (system or "")).strip().lower()
         allowed_paths_all = ["loinc_codes", "snomed_codes", "icd10_codes", "other_codes"]
         if sys_str == "loinc":
             paths = ["loinc_codes"]
@@ -182,16 +172,15 @@ class OpenSearchLabMapper:
             paths = allowed_paths_all
 
         code_lower = code.lower()
-
         nested_queries: List[Dict[str, Any]] = []
         for p in paths:
             per_path_dismax = {
                 "dis_max": {
                     "tie_breaker": 0.0,
                     "queries": [
-                        {"term": {f"{p}.code": {"value": code, "boost": 10.0}}},  # exact
-                        {"prefix": {f"{p}.code": {"value": code_lower, "boost": 7.0}}},  # prefix
-                        {"fuzzy":  {f"{p}.code": {"value": code, "fuzziness": "AUTO", "boost": 5.0}}},  # fuzzy
+                        {"term": {f"{p}.code": {"value": code, "boost": 10.0}}},
+                        {"prefix": {f"{p}.code": {"value": code_lower, "boost": 7.0}}},
+                        {"fuzzy":  {f"{p}.code": {"value": code, "fuzziness": "AUTO", "boost": 5.0}}},
                     ]
                 }
             }
@@ -205,7 +194,107 @@ class OpenSearchLabMapper:
         }
         return query
 
-    # ---- API-shape methods (giữ nguyên output format) ----
+    # ---- query builders: code search for UTS (new, with paging) ----
+    def _build_code_query_uts(self, code: str, size: int, from_: int, paths: List[str]) -> Dict[str, Any]:
+        code_lower = (code or "").lower()
+        nested_queries: List[Dict[str, Any]] = []
+        for p in paths:
+            per_path = {
+                "dis_max": {
+                    "tie_breaker": 0.0,
+                    "queries": [
+                        {"term": {f"{p}.code": {"value": code, "boost": 10.0}}},
+                        {"prefix": {f"{p}.code": {"value": code_lower, "boost": 7.0}}},
+                        {"fuzzy":  {f"{p}.code": {"value": code, "fuzziness": "AUTO", "boost": 4.0}}},
+                    ]
+                }
+            }
+            nested_queries.append({"nested": {"path": p, "query": per_path}})
+
+        return {
+            "from": from_,
+            "size": size,
+            "_source": True,
+            "track_total_hits": True,
+            "query": {"dis_max": {"tie_breaker": 0.0, "queries": nested_queries}},
+        }
+
+    # ---- UTS-like search (reduced): always return CUI-level ----
+    def uts_search(
+        self,
+        string: str,
+        *,
+        search_type: SearchType,
+        input_type: InputType,
+        sabs: Optional[List[str]],
+        page_number: int,
+        page_size: int,
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        """
+        Return (total_approx, rows) where rows follow UTS searchResults (CUI-level).
+        """
+        # SAB filter
+        sab_filter = None
+        if sabs:
+            sab_filter = {s.strip().upper() for s in sabs if s and s.strip()}
+
+        from_ = max(0, (page_number - 1) * page_size)
+
+        def concept_hits_to_rows(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for h in hits:
+                src = h.get("_source", {})
+                # if SAB filter is provided: keep concept that has at least one code in those SABs
+                if sab_filter:
+                    found = False
+                    for arr in ("loinc_codes", "snomed_codes", "icd10_codes", "other_codes"):
+                        for sc in src.get(arr, []) or []:
+                            if sc.get("sab") in sab_filter:
+                                found = True
+                                break
+                        if found:
+                            break
+                    if not found:
+                        continue
+                cui = src.get("cui")
+                name = src.get("preferred_term") or (src.get("synonyms") or [None])[0] or ""
+                root = (src.get("source_vocabularies") or [None])[0] or "UMLS"
+                rows.append({
+                    "ui": cui,
+                    "rootSource": root,
+                    "uri": f"/content/current/CUI/{cui}",
+                    "name": name,
+                })
+            return rows
+
+        # code-like input -> prioritize code search first
+        is_code_like = input_type in {InputType.code, InputType.sourceUi, InputType.sourceConcept, InputType.sourceDescriptor}
+        if is_code_like:
+            paths = ["loinc_codes", "snomed_codes", "icd10_codes", "other_codes"]
+            if sab_filter:
+                # simplify: if the SAB filter is entirely within LOINC/SNOMED/ICD10, narrow paths accordingly
+                if sab_filter.issubset({"LNC", "LOINC"}):
+                    paths = ["loinc_codes"]
+                elif sab_filter.issubset({"SNOMEDCT_US", "SNOMEDCT"}):
+                    paths = ["snomed_codes"]
+                elif sab_filter.issubset({"CCSR_ICD10CM", "CCSR_ICD10PCS", "ICD10PCS", "ICD10", "ICD10CM"}):
+                    paths = ["icd10_codes"]
+            body = self._build_code_query_uts(string, page_size, from_, paths)
+            data = self._search(body)
+            total = data.get("hits", {}).get("total", {}).get("value", 0)
+            hits = data.get("hits", {}).get("hits", [])
+            rows = concept_hits_to_rows(hits)
+            return total, rows
+
+        # text search
+        body = self._build_text_query_uts(string, page_size, from_, search_type)
+        data = self._search(body)
+        total = data.get("hits", {}).get("total", {}).get("value", 0)
+        hits = data.get("hits", {}).get("hits", [])
+        rows = concept_hits_to_rows(hits)
+        return total, rows
+
+    # ---- API-shape methods (unchanged) ----
     def map_lab_name_to_codes(self, lab_name: str, size: int = 25) -> Dict[str, Any]:
         body = self._build_dismax_query(lab_name, size=size)
         res = self._search(body)
@@ -289,7 +378,7 @@ class OpenSearchLabMapper:
         return src
 
 
-# =============== FastAPI (lifespan) =================
+# =============== FastAPI (lifespan) ===============
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not (OPENSEARCH_URL and OPENSEARCH_USER and OPENSEARCH_PASSWORD):
@@ -324,7 +413,58 @@ def get_mapper(request: Request) -> OpenSearchLabMapper:
     return mapper
 
 
-# =============== Endpoints (giữ nguyên schema output) ===============
+# ==================== NEW: UTS-like search (reduced) ====================
+@app.get("/search-uts")
+async def uts_like_search(
+    string: str = Query(..., description="Term or code"),
+    inputType: InputType = Query(InputType.atom, description="atom | code | sourceConcept | sourceDescriptor | sourceUi | tty"),
+    sabs: Optional[str] = Query(None, description="Comma-separated RSABs (e.g., LNC,SNOMEDCT_US)"),
+    searchType: SearchType = Query(SearchType.words, description="words | exact | rightTruncation | leftTruncation | normalizedString | normalizedWords"),
+    pageNumber: int = Query(1, ge=1),
+    pageSize: int = Query(25, ge=1, le=200),
+    mapper: OpenSearchLabMapper = Depends(get_mapper),
+):
+    """
+    Return a schema similar to UTS /search (reduced, CUI-level only):
+    {
+      "pageSize": n,
+      "pageNumber": m,
+      "result": {"classType":"searchResults","results":[{"ui": CUI, "rootSource": ..., "uri": ..., "name": ...}, ...]}
+    }
+    No results / end of pages: results = [{"ui":"NONE","name":"NO RESULTS"}]
+    """
+    sab_list = [s.strip().upper() for s in (sabs.split(",") if sabs else []) if s.strip()]
+
+    total, rows = mapper.uts_search(
+        string=string,
+        search_type=searchType,
+        input_type=inputType,
+        sabs=sab_list or None,
+        page_number=pageNumber,
+        page_size=pageSize,
+    )
+
+    if not rows:
+        return {
+            "pageSize": pageSize,
+            "pageNumber": pageNumber,
+            "result": {
+                "classType": "searchResults",
+                "results": [{"ui": "NONE", "name": "NO RESULTS"}],
+            },
+        }
+
+    return {
+        "pageSize": pageSize,
+        "pageNumber": pageNumber,
+        "result": {
+            "classType": "searchResults",
+            "results": rows,
+        },
+    }
+
+
+# =============== Endpoints (unchanged schema) ===============
 @app.get("/map-lab")
 async def map_lab_name(
     lab_name: str = Query(..., description="Lab test name to map to standard codes"),
@@ -374,7 +514,7 @@ async def search_code(
     mapper: OpenSearchLabMapper = Depends(get_mapper),
 ):
     """
-    Tìm concept theo mã code. Ưu tiên exact > prefix > fuzzy.
+    Find concepts by a code. Ranking priority: exact > prefix > fuzzy.
     - system: dropdown {loinc | snomed | icd10 | other}
     """
     out = mapper.search_by_code(code, size=limit, system=system)

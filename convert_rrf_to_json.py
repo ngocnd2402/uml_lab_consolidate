@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from typing import Dict, List, Any
@@ -129,11 +131,9 @@ def export_concepts_to_ndjson(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _is_lab(con: Concept) -> bool:
-        lab_types = {
-            "Laboratory Procedure", "Diagnostic Procedure", "Laboratory or Test Result",
-            "Clinical Finding", "Finding", "Quantitative Concept", "Substance"
-        }
-        return any(st in lab_types for st in con.semantic_types)
+        # Chỉ giữ concept có semantic_type chứa 'lab' hoặc 'laboratory' (không phân biệt hoa/thường)
+        return any(("lab" in (st or "").lower() or "laboratory" in (st or "").lower())
+                   for st in (con.semantic_types or []))
 
     written = 0
     with out_path.open("w", encoding="utf-8") as f:
